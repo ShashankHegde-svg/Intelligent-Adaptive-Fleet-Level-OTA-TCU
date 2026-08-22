@@ -1,3 +1,5 @@
+This is a TCU unit
+
 # CONVOY — Adaptive Fleet-Level OTA Framework
 
 Phase 1 of the build: the **transport layer**. One repository, three roles. Each machine uses only the folder that belongs to it.
@@ -59,10 +61,10 @@ convoy/
 
 **All four laptops clone the same repository.** They simply run different folders. Nothing is duplicated, and the device laptops never see the signing key because it is generated locally on the Mac and gitignored.
 
-| Machine | Uses | Ignores |
-|---|---|---|
-| Laptop A (Mac) | `admin/`, `tools/`, `docs/`, later `backend/` + `dashboard/` | `device/` |
-| Laptop B/C/D (Windows) | `device/` | everything else |
+| Machine                | Uses                                                         | Ignores         |
+| ---------------------- | ------------------------------------------------------------ | --------------- |
+| Laptop A (Mac)         | `admin/`, `tools/`, `docs/`, later `backend/` + `dashboard/` | `device/`       |
+| Laptop B/C/D (Windows) | `device/`                                                    | everything else |
 
 ---
 
