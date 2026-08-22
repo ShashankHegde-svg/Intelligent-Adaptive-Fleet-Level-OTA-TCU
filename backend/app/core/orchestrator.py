@@ -65,9 +65,16 @@ from app.db.models import Batch, Campaign, CampaignTarget, Device, Firmware, Rol
 from app.db.session import session_scope
 from app.mqtt import topics
 from app.services.firmware_service import load_package, load_signing_key
+from app.services.eventbus import Channel, bus
 from app.services.ingest import Ingestor
 
 log = structlog.get_logger(__name__)
+
+# How many times a device may be passed over for a transient reason before the
+# campaign gives up on it. Three passes is enough to survive a broker reconnect
+# or a device rebooting, without keeping a rollout open for a machine that is
+# switched off.
+MAX_DEFERRALS = 3
 
 
 def _now() -> datetime:
@@ -200,6 +207,12 @@ class Orchestrator:
 
         log.info("batch_opened", campaign_id=campaign.campaign_id, batch=index,
                  planned=planned, selected=len(selected), canary=is_canary)
+        bus.publish(Channel.BATCH, {
+            "campaign_id": campaign.campaign_id, "batch_index": index,
+            "state": "opened", "planned_size": planned,
+            "actual_size": len(selected), "is_canary": is_canary,
+            "device_ids": [t.device_id for t in selected],
+        })
 
         firmware = await session.scalar(
             select(Firmware).where(Firmware.firmware_id == campaign.firmware_id))
@@ -236,6 +249,7 @@ class Orchestrator:
                 target.state = str(TargetState.SKIPPED)
                 target.last_reason_code = str(result.reason)
                 target.ended_at = _now()
+                target.deferrals += 1
                 batch.skipped_count += 1
                 await ingestor.record_event(
                     device_id=device.device_id, campaign_id=campaign.campaign_id,
@@ -253,13 +267,34 @@ class Orchestrator:
                 min_network_quality=campaign.min_network_quality)
             signed = sign_manifest(manifest, key)
 
+            # Publishing can fail: the broker connection may have dropped
+            # between the health check and this call. Letting that exception
+            # escape would abort the ENTIRE batch and roll back every offer
+            # already sent in it, so one flaky publish costs fifteen devices
+            # their turn. Contain it to the device it affects.
+            try:
+                await self.bridge.publish(
+                    topics.server_topic(device.device_id, topics.ServerLeaf.OTA_OFFER),
+                    signed.to_wire())
+            except Exception as exc:
+                target.state = str(TargetState.SKIPPED)
+                target.last_reason_code = str(ReasonCode.SKIPPED_OFFLINE)
+                target.deferrals += 1
+                target.ended_at = _now()
+                batch.skipped_count += 1
+                await ingestor.record_event(
+                    device_id=device.device_id, campaign_id=campaign.campaign_id,
+                    batch_id=batch.id, event_type=EventType.OFFER_REJECTED,
+                    reason_code=str(ReasonCode.SKIPPED_OFFLINE), source="server",
+                    payload={"detail": f"offer publish failed: {exc}",
+                             "deferrals": target.deferrals})
+                log.warning("offer_publish_failed", device_id=device.device_id,
+                            error=str(exc)[:120])
+                continue
+
             target.state = str(TargetState.OFFERED)
             target.attempts += 1
             target.offer_nonce = manifest["nonce"]
-
-            await self.bridge.publish(
-                topics.server_topic(device.device_id, topics.ServerLeaf.OTA_OFFER),
-                signed.to_wire())
             await ingestor.record_event(
                 device_id=device.device_id, campaign_id=campaign.campaign_id,
                 batch_id=batch.id, event_type=EventType.OFFER_SENT,
@@ -332,6 +367,11 @@ class Orchestrator:
     async def handle_progress(self, device_id: str, payload: dict) -> None:
         campaign_id = payload.get("campaign_id")
         index = int(payload.get("chunk_index", -1))
+        bus.publish(Channel.PROGRESS, {
+            "device_id": device_id, "campaign_id": campaign_id,
+            "chunk_index": index, "chunk_count": payload.get("chunk_count"),
+            "percent": payload.get("percent"),
+        })
         async with session_scope() as session:
             await session.execute(
                 update(CampaignTarget)
@@ -376,6 +416,21 @@ class Orchestrator:
                              battery: int | None, network: int | None,
                              new_version: str | None = None,
                              chunk_index: int | None = None) -> None:
+        # Idempotent: a device that rejects an offer publishes BOTH an ack with
+        # accepted=false AND a result with the failure, so this is reached twice
+        # for the same outcome. Without this guard the batch tally counts the
+        # device twice -- a batch of five reports "3 ok, 3 failed".
+        #
+        # The adaptive engine reads target reason codes rather than batch
+        # tallies, so its arithmetic was never wrong; but the stored counts feed
+        # the dashboard and the analytics page, and a rollout report that says
+        # six things happened to five devices is not a report anyone can trust.
+        if target.state in (str(TargetState.SUCCEEDED), str(TargetState.FAILED),
+                            str(TargetState.SKIPPED)):
+            log.debug("duplicate_outcome_ignored", device_id=target.device_id,
+                      already=target.state, repeated=reason)
+            return
+
         code = ReasonCode(reason) if reason in ReasonCode.__members__.values() \
             else ReasonCode.FAILED_TIMEOUT
         success = code == ReasonCode.SUCCESS
@@ -516,6 +571,26 @@ class Orchestrator:
             reason_code=str(decision.reason), detail=decision.detail,
         ))
 
+        bus.publish(Channel.DECISION, {
+            "campaign_id": campaign.campaign_id, "batch_index": batch.index,
+            "prev_batch_size": decision.previous_batch_size,
+            "new_batch_size": decision.new_batch_size,
+            "observed_failure_rate": decision.observed_failure_rate,
+            "ewma": decision.ewma_failure_rate,
+            "attempted": decision.attempted, "failures": decision.failures,
+            "skipped": decision.skipped, "action": str(decision.action),
+            "reason_code": str(decision.reason), "detail": decision.detail,
+            "failed_devices": [
+                {"device_id": t.device_id, "reason": t.last_reason_code}
+                for t in targets
+                if t.last_reason_code and t.last_reason_code.startswith("FAILED_")],
+        })
+        bus.publish(Channel.BATCH, {
+            "campaign_id": campaign.campaign_id, "batch_index": batch.index,
+            "state": "closed", "success": batch.success_count,
+            "failure": batch.failure_count, "skipped": batch.skipped_count,
+        })
+
         # The banner. A graded success criterion, printed to stdout on purpose
         # so it is legible on a projector next to the dashboard.
         print("\n" + self._banner(decision, campaign.campaign_id, batch.index,
@@ -530,6 +605,9 @@ class Orchestrator:
                        CampaignTarget.state == str(TargetState.PENDING))
                 .values(state=str(TargetState.SKIPPED),
                         last_reason_code=str(ReasonCode.ABORTED_FAILURE_STORM)))
+            bus.publish(Channel.CAMPAIGN, {"campaign_id": campaign.campaign_id,
+                                           "state": str(CampaignState.ABORTED),
+                                           "reason": str(decision.reason)})
             log.error("campaign_aborted", campaign_id=campaign.campaign_id,
                       reason=str(decision.reason))
             return
@@ -579,6 +657,35 @@ class Orchestrator:
                      attempt=target.attempts + 1, of=campaign.max_attempts,
                      reason=target.last_reason_code)
 
+        # Transient skips get another chance. A device passed over because it
+        # was offline, or its battery was low, has not failed -- the system
+        # declined to try. In a real fleet that device is a parked car, and it
+        # should be offered the update on a later pass rather than written off,
+        # which is what happened when a broker reconnect marked two healthy
+        # devices SKIPPED_OFFLINE and the campaign completed without them.
+        #
+        # Bounded by max_deferrals so a permanently absent device cannot keep a
+        # campaign open forever.
+        deferred = list(await session.scalars(
+            select(CampaignTarget).where(
+                CampaignTarget.campaign_id == campaign.campaign_id,
+                CampaignTarget.batch_id == batch.id,
+                CampaignTarget.state == str(TargetState.SKIPPED))))
+        for target in deferred:
+            transient = target.last_reason_code in (
+                str(ReasonCode.SKIPPED_OFFLINE),
+                str(ReasonCode.SKIPPED_INELIGIBLE_LOW_BATTERY),
+                str(ReasonCode.SKIPPED_INELIGIBLE_POOR_NETWORK),
+            )
+            if not transient or target.deferrals >= MAX_DEFERRALS:
+                continue
+            target.state = str(TargetState.PENDING)
+            target.batch_id = None
+            target.ended_at = None
+            log.info("target_deferred", device_id=target.device_id,
+                     deferral=target.deferrals, of=MAX_DEFERRALS,
+                     reason=target.last_reason_code)
+
         # Push the re-queued rows to the database before asking whether any
         # PENDING targets remain.
         #
@@ -610,6 +717,9 @@ class Orchestrator:
     async def _complete_campaign(self, session: AsyncSession, campaign: Campaign) -> None:
         campaign.state = str(CampaignState.COMPLETED)
         campaign.ended_at = _now()
+        bus.publish(Channel.CAMPAIGN, {"campaign_id": campaign.campaign_id,
+                                       "state": str(CampaignState.COMPLETED),
+                                       "batches": campaign.batches_completed})
         log.info("campaign_completed", campaign_id=campaign.campaign_id,
                  batches=campaign.batches_completed)
 
